@@ -1,0 +1,13 @@
+model_list:
+  - model_name: gemini-2.0-flash
+    litellm_params:
+      model: ollama/gemma4:e2b
+      api_base: http://localhost:11434
+  - model_name: gemini-2.0-flash-lite
+    litellm_params:
+      model: ollama/gemma4:e2b
+      api_base: http://localhost:11434
+  - model_name: gemini-3.0-pro
+    litellm_params:
+      model: ollama/gemma4:e2b
+      api_base: http://localhost:11434

@@ -4,6 +4,8 @@ import httpx
 import uvicorn
 import json
 import re
+import os
+import signal
 
 app = FastAPI()
 
@@ -13,14 +15,22 @@ MODEL_ALIAS = "gemma4:e4b"
 # --- THE HARDENED LINUX PROMPT ---
 LINUX_SYSTEM_PROMPT = """You are GEMMA 4, a high-performance local Linux System Engineer.
 ENVIRONMENT: Ubuntu 24.04 LTS.
-RULE: Give ONE brief, technical response. Do NOT paraphrase or repeat your answer. 
-STOP immediately after your first paragraph.
+RULE: Give ONE brief, technical response. Do NOT paraphrase or repeat your answer.
+
+CRITICAL: When your task is fully complete and you have provided the answer, output EXACTLY this token on its own line: [TASK_COMPLETE]
+Do NOT output [TASK_COMPLETE] if you are calling a tool. Only output it after the final result is delivered.
 """
 
 @app.get("/v1/models")
 @app.get("/v1/models/{path:path}")
 async def get_models(path: str = None):
     return {"models": [{"name": "models/gemma-4-e4b"}]}
+
+@app.post("/shutdown")
+async def shutdown():
+    print(">>> Proxy received shutdown signal. Powering down...")
+    os.kill(os.getpid(), signal.SIGTERM)
+    return {"status": "shutting down"}
 
 def translate_messages(contents):
     messages = [{"role": "system", "content": LINUX_SYSTEM_PROMPT}]
@@ -61,10 +71,10 @@ async def catch_all_post(request: Request, path: str):
     if "onboardUser" in path: return {"status": "ok"}
     if "retrieveUserQuota" in path: return {"quota": "unlimited"}
     if "listExperiments" in path: return {"experiments": []}
-    if "predict" in path: return {"prediction": "research"}
+    if "predict" in path: return {"prediction": "act"}
 
     if "stream" not in path and "stream" not in request.query_params.get("alt", ""):
-        mock_decision = {"decision": "research", "reason": "Local", "complexity_reasoning": "Offline", "complexity_score": 1}
+        mock_decision = {"decision": "research", "reason": "Local", "complexity_score": 1}
         return {"candidates": [{"content": {"parts": [{"text": json.dumps(mock_decision)}]}, "finishReason": "STOP"}]}
 
     messages = translate_messages(body.get("contents", []))
@@ -75,7 +85,7 @@ async def catch_all_post(request: Request, path: str):
         "messages": messages, 
         "stream": True,
         "options": {
-            "stop": ["\n\n", "User:", "Gemma:", "User>", "Gemma>", "<|file_separator|>"],
+            "stop": ["User:", "Gemma:", "User>", "Gemma>", "<|file_separator|>"],
             "temperature": 0.05,
             "repeat_penalty": 1.6,
             "num_ctx": 16384
@@ -86,35 +96,37 @@ async def catch_all_post(request: Request, path: str):
     async def generate():
         async with httpx.AsyncClient() as client:
             async with client.stream("POST", OLLAMA_URL, json=ollama_payload, timeout=None) as response:
-                history = ""
+                buffer = ""
                 async for line in response.aiter_lines():
                     if line:
                         try:
                             chunk = json.loads(line)
                             msg = chunk.get("message", {})
                             content = msg.get("content", "")
-                            if not content and not msg.get("tool_calls"): continue
+                            buffer += content
                             
-                            # Semantic Kill-Switch
-                            if "I am Gemma" in content and "I am Gemma" in history: break
-                            history += content
+                            if "[TASK_COMPLETE]" in buffer:
+                                clean_text = buffer.replace("[TASK_COMPLETE]", "").strip()
+                                if clean_text:
+                                    parts = [{"text": clean_text.replace("Gemini", "Gemma")}]
+                                    gemini_chunk = {"candidates": [{"content": {"parts": parts}}]}
+                                    yield f"data: {json.dumps(gemini_chunk)}\n\n"
+                                stop_chunk = {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}
+                                yield f"data: {json.dumps(stop_chunk)}\n\n"
+                                return 
                             
-                            parts = []
-                            if content: parts.append({"text": content.replace("Gemini", "Gemma")})
-                            if msg.get("tool_calls"):
-                                for tc in msg["tool_calls"]:
-                                    parts.append({"functionCall": {"name": tc["function"]["name"], "args": tc["function"]["arguments"]}})
-                            
-                            # STRICT SSE FORMAT: data: JSON\n\n
-                            # (The empty line \n is the separator the CLI expects)
-                            gemini_chunk = {"candidates": [{"content": {"parts": parts}}]}
-                            yield f"data: {json.dumps(gemini_chunk)}\n\n"
-                            
-                            if chunk.get("done"):
-                                # Send final stop signal
-                                final_chunk = {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}
-                                yield f"data: {json.dumps(final_chunk)}\n\n"
-                                break
+                            if not chunk.get("done"):
+                                if content:
+                                    parts = [{"text": content.replace("Gemini", "Gemma")}]
+                                    if msg.get("tool_calls"):
+                                        for tc in msg["tool_calls"]:
+                                            parts.append({"functionCall": {"name": tc["function"]["name"], "args": tc["function"]["arguments"]}})
+                                    gemini_chunk = {"candidates": [{"content": {"parts": parts}}]}
+                                    yield f"data: {json.dumps(gemini_chunk)}\n\n"
+                            else:
+                                stop_chunk = {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}
+                                yield f"data: {json.dumps(stop_chunk)}\n\n"
+                                return
                         except: continue
 
     return StreamingResponse(generate(), media_type="text/event-stream")
